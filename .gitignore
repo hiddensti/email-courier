@@ -1,0 +1,7 @@
+passwords.yaml
+config.yaml
+db/
+*.db
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,84 @@
+# Email Courier — config template
+# Copy this file as config.yaml and fill in your values
+
+telegram:
+  bot_token: "YOUR_BOT_TOKEN"        # Get from @BotFather in Telegram
+  chat_id: "YOUR_CHAT_ID"            # Get from @userinfobot in Telegram
+
+digest:
+  schedule: ["06:00", "18:00"]       # Digest times (your timezone)
+  timezone: "America/Chicago"        # Your timezone (IANA format)
+
+quiet_hours:
+  start: 22    # No instant alerts after this hour
+  end: 6       # Until this hour (accumulates for morning digest)
+
+mailboxes:
+  # Add your email accounts here. Each needs an IMAP app password.
+  #
+  # Gmail: Settings → Security → 2FA → App passwords → generate
+  # Yahoo: Account Security → Generate app password
+  # Mail.ru: Settings → Security → App passwords
+  # Outlook: Account → Security → App passwords
+
+  - name: "My Gmail"
+    type: imap
+    email: "you@gmail.com"
+    server: "imap.gmail.com"
+    context_hint: >
+      Short description of what this inbox is for.
+      This helps AI understand priority. Example:
+      "Personal email. Important: bank, tax, legal, school.
+      Marketing and newsletters = noise."
+
+  - name: "My Yahoo"
+    type: imap
+    email: "you@yahoo.com"
+    server: "imap.mail.yahoo.com"
+    context_hint: >
+      Describe what's in this inbox so AI classifies correctly.
+
+  # Add more mailboxes as needed:
+  # - name: "Work"
+  #   type: imap
+  #   email: "you@company.com"
+  #   server: "imap.company.com"
+  #   context_hint: "Work email. Everything is important."
+
+filters:
+  # Domains to ALWAYS ignore (pure spam)
+  hard_skip_domains:
+    - "example-spam.com"
+    # Add your spam domains here
+
+  # Senders to ALWAYS ignore
+  hard_skip_senders:
+    - "no-reply@spam-service.com"
+
+  # Domains to NEVER ignore (always process)
+  never_skip_domains:
+    - "irs.gov"
+    - "chase.com"
+    - "paypal.com"
+    # Add your important domains
+
+  # Keywords that always trigger alerts
+  never_skip_keywords:
+    - "invoice"
+    - "payment"
+    - "overdue"
+    - "deadline"
+    - "action required"
+    - "security alert"
+
+  # Per-sender rules
+  sender_rules:
+    - sender: "noreply@linkedin.com"
+      action: ignore
+    # - sender: "boss@company.com"
+    #   action: critical
+
+  # VIP senders — always instant alert
+  vip_senders:
+    - "your-accountant@example.com"
+    # Add people whose emails you never want to miss
