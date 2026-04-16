@@ -29,8 +29,9 @@ with open(CONFIG_PATH) as f:
 BOT_TOKEN = _cfg["telegram"]["bot_token"]
 ALLOWED_CHAT_ID = int(_cfg["telegram"]["chat_id"])
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# Initialized in main() — recreated on every restart so crash-loop recovery works.
+bot = None
+dp = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("email-courier")
@@ -42,7 +43,6 @@ def check_user(chat_id: int) -> bool:
 
 # ============ BUTTON HANDLERS ============
 
-@dp.callback_query(F.data.startswith("full:"))
 async def on_full_text(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -66,7 +66,6 @@ async def on_full_text(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("ask:"))
 async def on_ask(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -90,7 +89,6 @@ async def on_ask(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("done:"))
 async def on_done(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -98,7 +96,6 @@ async def on_done(callback: CallbackQuery):
     await callback.answer("✅ Done")
 
 
-@dp.callback_query(F.data.startswith("vip:"))
 async def on_vip(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -117,7 +114,6 @@ async def on_vip(callback: CallbackQuery):
         await callback.answer("Not found")
 
 
-@dp.callback_query(F.data.startswith("mute:"))
 async def on_mute(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -136,7 +132,6 @@ async def on_mute(callback: CallbackQuery):
         await callback.answer("Not found")
 
 
-@dp.callback_query(F.data.startswith("skip_type:"))
 async def on_skip_type(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -156,7 +151,6 @@ async def on_skip_type(callback: CallbackQuery):
         await callback.answer("Not found")
 
 
-@dp.callback_query(F.data.startswith("keep_type:"))
 async def on_keep_type(callback: CallbackQuery):
     if not check_user(callback.message.chat.id):
         return
@@ -178,7 +172,6 @@ async def on_keep_type(callback: CallbackQuery):
 
 # ============ COMMANDS ============
 
-@dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if not check_user(message.chat.id):
         return
@@ -187,7 +180,6 @@ async def cmd_stats(message: Message):
     await message.reply(text, parse_mode=ParseMode.HTML)
 
 
-@dp.message(Command("health"))
 async def cmd_health(message: Message):
     if not check_user(message.chat.id):
         return
@@ -198,6 +190,7 @@ async def cmd_health(message: Message):
 # ============ EMAIL CHECK LOOP ============
 
 CHECK_INTERVAL = 300
+FAILURE_ALERT_THRESHOLD = 3  # alert after 3 consecutive failures (~15 min)
 
 
 async def run_subprocess(args, timeout=120):
@@ -222,28 +215,50 @@ async def email_check_loop():
 
     digest_hours = _cfg.get("digest", {}).get("schedule", ["06:00", "18:00"])
     digest_hour_ints = [int(t.split(":")[0]) for t in digest_hours]
-    last_digest_hour = None
+
+    consecutive_failures = 0
 
     while True:
         try:
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_check.py")
             stdout, stderr, rc = await run_subprocess([sys.executable, script], timeout=120)
+
+            if rc == 0 and not stderr:
+                consecutive_failures = 0
+
             if stdout:
                 log.info(f"Check: {stdout.split(chr(10))[-1]}")
-            if stderr:
-                log.error(f"Check error: {stderr[:200]}")
 
+            if stderr or rc != 0:
+                consecutive_failures += 1
+                log.error(f"Check error (fail #{consecutive_failures}): {stderr[:500]}")
+                if consecutive_failures == FAILURE_ALERT_THRESHOLD:
+                    # Alert user that email checking is broken
+                    try:
+                        await bot.send_message(
+                            ALLOWED_CHAT_ID,
+                            f"🚨 <b>Email check broken!</b>\n"
+                            f"{consecutive_failures} failures in a row.\n"
+                            f"<code>{escape((stderr or 'rc=' + str(rc))[:300])}</code>",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+
+            # Digest — state persisted in DB so restarts don't re-send or skip
             from datetime import datetime
             from zoneinfo import ZoneInfo
             tz = _cfg.get("digest", {}).get("timezone", "UTC")
             now = datetime.now(ZoneInfo(tz))
-            current_hour = now.hour
+            today_key = now.strftime("%Y-%m-%d")
 
-            if current_hour in digest_hour_ints and current_hour != last_digest_hour:
-                last_digest_hour = current_hour
-                digest_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_digest.py")
-                await run_subprocess([sys.executable, digest_script], timeout=60)
-                log.info("Digest sent")
+            if now.hour in digest_hour_ints:
+                digest_key = f"digest_{today_key}_{now.hour}"
+                if not db_ops.get_state(digest_key):
+                    digest_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_digest.py")
+                    await run_subprocess([sys.executable, digest_script], timeout=60)
+                    db_ops.set_state(digest_key, "sent")
+                    log.info(f"Digest sent: {digest_key}")
 
         except Exception as e:
             log.error(f"Check loop error: {e}")
@@ -273,10 +288,29 @@ def _handle_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
+# ============ MAIN ============
+
 async def main():
+    """Create fresh Bot+Dispatcher every startup so crash-restart works cleanly."""
+    global bot, dp
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+
+    # Register handlers on the fresh dispatcher
+    dp.callback_query.register(on_full_text, F.data.startswith("full:"))
+    dp.callback_query.register(on_ask, F.data.startswith("ask:"))
+    dp.callback_query.register(on_done, F.data.startswith("done:"))
+    dp.callback_query.register(on_vip, F.data.startswith("vip:"))
+    dp.callback_query.register(on_mute, F.data.startswith("mute:"))
+    dp.callback_query.register(on_skip_type, F.data.startswith("skip_type:"))
+    dp.callback_query.register(on_keep_type, F.data.startswith("keep_type:"))
+    dp.message.register(cmd_stats, Command("stats"))
+    dp.message.register(cmd_health, Command("health"))
+
     log.info("Email Courier daemon starting...")
     asyncio.create_task(email_check_loop())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     import time
