@@ -5,6 +5,7 @@ Single process: Telegram bot + email check loop + digest scheduler.
 """
 import asyncio
 import logging
+import signal
 import sys
 import os
 import yaml
@@ -198,6 +199,23 @@ async def cmd_health(message: Message):
 
 CHECK_INTERVAL = 300
 
+
+async def run_subprocess(args, timeout=120):
+    """Run subprocess without blocking the event loop."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return stdout.decode().strip(), stderr.decode().strip(), proc.returncode
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return "", "Timed out", -1
+
+
 async def email_check_loop():
     await asyncio.sleep(10)
     log.info(f"Email check loop started (every {CHECK_INTERVAL}s)")
@@ -208,13 +226,12 @@ async def email_check_loop():
 
     while True:
         try:
-            import subprocess
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_check.py")
-            result = subprocess.run([sys.executable, script], capture_output=True, text=True, timeout=120)
-            if result.stdout:
-                log.info(f"Check: {result.stdout.strip().split(chr(10))[-1]}")
-            if result.stderr:
-                log.error(f"Check error: {result.stderr[:200]}")
+            stdout, stderr, rc = await run_subprocess([sys.executable, script], timeout=120)
+            if stdout:
+                log.info(f"Check: {stdout.split(chr(10))[-1]}")
+            if stderr:
+                log.error(f"Check error: {stderr[:200]}")
 
             from datetime import datetime
             from zoneinfo import ZoneInfo
@@ -225,13 +242,35 @@ async def email_check_loop():
             if current_hour in digest_hour_ints and current_hour != last_digest_hour:
                 last_digest_hour = current_hour
                 digest_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_digest.py")
-                subprocess.run([sys.executable, digest_script], capture_output=True, text=True, timeout=60)
+                await run_subprocess([sys.executable, digest_script], timeout=60)
                 log.info("Digest sent")
 
         except Exception as e:
             log.error(f"Check loop error: {e}")
 
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ============ GRACEFUL SHUTDOWN ============
+def checkpoint_db():
+    """Force WAL checkpoint — flush all WAL data into main DB file."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_ops.DB_PATH, timeout=10)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        log.info("DB checkpoint done, WAL truncated")
+    except Exception as e:
+        log.error(f"Checkpoint error: {e}")
+
+
+def _handle_sigterm(signum, frame):
+    log.info("SIGTERM received — shutting down gracefully")
+    checkpoint_db()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 async def main():
@@ -245,7 +284,12 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
+            log.info("KeyboardInterrupt — shutting down")
+            checkpoint_db()
+            break
+        except SystemExit:
             break
         except Exception as e:
             log.error(f"Bot crashed: {e}, restarting in 10s...")
+            checkpoint_db()
             time.sleep(10)
